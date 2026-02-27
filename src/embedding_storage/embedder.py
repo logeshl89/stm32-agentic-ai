@@ -209,7 +209,8 @@ class VectorStoreManager:
                 'chunk': self.chunks[idx],
                 'similarity': similarity,
                 'metadata': self.metadata[idx],
-                'embedding_index': idx
+                'embedding_index': idx,
+                'embedding': self.embeddings[idx]
             })
         
         logger.info(f"Similarity search returned {len(results)} results")
