@@ -42,6 +42,7 @@ class CitationFormatter:
         for i, doc in enumerate(docs):
             citation = formatter(doc, i+1)
             citation['relevance_score'] = self._calculate_relevance_score(doc, query, answer)
+            citation['matched_snippet'] = self._match_snippet(doc.get('chunk', ''), query)
             citations.append(citation)
         
         # Sort by relevance score (descending)
@@ -75,7 +76,8 @@ class CitationFormatter:
             'section_type': metadata.get('section_type', 'N/A'),
             'token_count': metadata.get('token_count', 0),
             'chunk_id': metadata.get('chunk_id', ''),
-            'similarity': doc.get('similarity', 0.0)
+            'similarity': doc.get('similarity', 0.0),
+            'evidence_snippet': self._build_evidence_snippet(doc.get('chunk', ''))
         }
     
     def _format_academic_citation(self, doc: Dict[str, Any], index: int) -> Dict[str, Any]:
@@ -125,6 +127,33 @@ class CitationFormatter:
             'pages': metadata.get('pages', [])
         }
     
+    def _build_evidence_snippet(self, chunk: str, max_chars: int = 220) -> str:
+        """Build a compact citation evidence snippet from a chunk."""
+        if not chunk:
+            return ""
+        compact = " ".join(chunk.split())
+        if len(compact) <= max_chars:
+            return compact
+        return compact[:max_chars].rstrip() + "..."
+
+    def _match_snippet(self, chunk: str, query: str, window: int = 200) -> str:
+        """Extract a snippet near the first matching query token."""
+        if not chunk:
+            return ""
+        compact = " ".join(chunk.split())
+        query_tokens = [t for t in query.lower().split() if len(t) > 2]
+        compact_lower = compact.lower()
+
+        for token in query_tokens:
+            idx = compact_lower.find(token)
+            if idx != -1:
+                start = max(0, idx - window // 3)
+                end = min(len(compact), idx + window)
+                snippet = compact[start:end]
+                return ("..." if start > 0 else "") + snippet + ("..." if end < len(compact) else "")
+
+        return self._build_evidence_snippet(chunk, max_chars=window)
+
     def _calculate_relevance_score(self, doc: Dict[str, Any], query: str, answer: str) -> float:
         """
         Calculate relevance score for a document based on query and answer

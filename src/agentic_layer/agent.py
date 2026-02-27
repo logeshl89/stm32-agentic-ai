@@ -2,12 +2,10 @@
 Agentic RAG System for STM32F446RE Documentation
 Implements advanced reasoning and query processing capabilities
 """
-from typing import List, Dict, Any, Optional, Tuple
-from src.retrieval.retriever import Retriever
-from src.embedding_storage.embedder import VectorStoreManager, Embedder
+from typing import List, Dict, Any, Optional
+from src.retrieval.retriever import Retriever, RetrievalStrategy
 from src.agentic_layer.answer_generator import AnswerGenerator
 import logging
-import json
 from enum import Enum
 
 logger = logging.getLogger(__name__)
@@ -77,6 +75,11 @@ class AgenticRAG:
             'citations': [],
             'reasoning_trace': [],
             'followup_questions': [],
+            'abstained': False,
+            'abstain_reason': '',
+            'next_best_queries': [],
+            'retrieval_strategy': None,
+            'retrieval_filters': {},
             'state': self.state.value
         }
         
@@ -89,18 +92,24 @@ class AgenticRAG:
             
             # Retrieve relevant documents
             self.state = AgentState.RETRIEVING
-            k = 5 if query_analysis['type'] == QueryType.SIMPLE_FACT else 8
+            k = self._determine_retrieval_k(query_analysis)
+            strategy = self._select_retrieval_strategy(query_analysis)
+            min_similarity = self._determine_min_similarity(query_analysis)
             filters = self._build_filters(query_analysis)
-            
+
             retrieved_docs = self.retriever.retrieve(
-                query, 
-                k=k, 
+                query,
+                k=k,
+                strategy=strategy,
                 filters=filters,
-                rerank=True
+                rerank=True,
+                min_similarity=min_similarity
             )
-            
+
             response['retrieved_docs'] = retrieved_docs
-            response['reasoning_trace'].append(f"Retrieved {len(retrieved_docs)} relevant documents")
+            response['retrieval_strategy'] = strategy.value
+            response['retrieval_filters'] = filters
+            response['reasoning_trace'].append(f"Retrieved {len(retrieved_docs)} relevant documents with {strategy.value}")
             
             # Generate answer based on retrieved context
             self.state = AgentState.GENERATING
@@ -110,6 +119,9 @@ class AgenticRAG:
             response['confidence'] = answer_result['confidence']
             response['citations'] = answer_result['citations']
             response['followup_questions'] = answer_result['followup_questions']
+            response['abstained'] = answer_result.get('abstained', False)
+            response['abstain_reason'] = answer_result.get('abstain_reason', '')
+            response['next_best_queries'] = answer_result.get('next_best_queries', [])
             
             # Log the interaction
             self._log_interaction(query, response)
@@ -128,6 +140,35 @@ class AgenticRAG:
         
         return response
     
+    def _determine_retrieval_k(self, query_analysis: Dict[str, Any]) -> int:
+        """Use query complexity/type to pick dynamic top-k."""
+        query_type = query_analysis.get('type')
+        complexity = query_analysis.get('complexity', 'medium')
+
+        if query_type == QueryType.SIMPLE_FACT:
+            return 4 if complexity == 'low' else 5
+        if query_type == QueryType.PROCEDURAL:
+            return 8 if complexity == 'high' else 6
+        if query_type in (QueryType.COMPARATIVE, QueryType.TROUBLESHOOTING):
+            return 8
+        return 7
+
+    def _determine_min_similarity(self, query_analysis: Dict[str, Any]) -> float:
+        """Tune retrieval threshold by query type."""
+        query_type = query_analysis.get('type')
+        if query_type == QueryType.SIMPLE_FACT:
+            return 0.35
+        if query_type == QueryType.TROUBLESHOOTING:
+            return 0.2
+        return 0.25
+
+    def _select_retrieval_strategy(self, query_analysis: Dict[str, Any]) -> RetrievalStrategy:
+        """Select retrieval strategy based on query intent."""
+        query_type = query_analysis.get('type')
+        if query_type in (QueryType.PROCEDURAL, QueryType.COMPARATIVE, QueryType.TROUBLESHOOTING):
+            return RetrievalStrategy.HYBRID
+        return RetrievalStrategy.SEMANTIC
+
     def _build_filters(self, query_analysis: Dict[str, Any]) -> Dict[str, Any]:
         """
         Build metadata filters based on query analysis
@@ -149,9 +190,14 @@ class AgenticRAG:
             filters['section_type'] = 'peripheral_description'
         
         # Add specific hardware component filters if identified
-        if 'components' in query_analysis:
-            # This would be expanded based on actual component recognition
-            pass
+        components = query_analysis.get('components', [])
+        peripherals = [c.upper() for c in components if c.upper() in {'GPIO', 'USART', 'SPI', 'I2C', 'TIM', 'ADC', 'DAC', 'DMA'}]
+        pins = [c.upper() for c in components if c.upper().startswith('P') and len(c) >= 3]
+
+        if peripherals:
+            filters['peripheral'] = peripherals[0]
+        if pins:
+            filters['pin'] = pins[0]
         
         return filters
     
@@ -171,19 +217,6 @@ class AgenticRAG:
         if not retrieved_docs:
             # Handle basic questions that don't require documentation
             return self._handle_basic_questions(query)
-
-        return {
-            'answer': "I couldn't find relevant information in the STM32F446RE documentation to answer your query.",
-            'confidence': 0.0,
-            'citations': [],
-            'followup_questions': []
-        }
-        
-        # Prepare context for the LLM
-        context = self._prepare_context(retrieved_docs)
-        
-        # Generate prompt for the LLM
-        prompt = self._construct_prompt(query, context, query_analysis)
         
         # Generate answer using the answer generator
         answer_result = self.answer_generator.generate_answer(query, retrieved_docs, query_analysis['type'].value if hasattr(query_analysis['type'], 'value') else str(query_analysis['type']))
@@ -205,13 +238,30 @@ class AgenticRAG:
         # Generate follow-up questions
         followup_questions = self._generate_followup_questions(query, answer)
         
+        abstained = confidence < 0.3
         return {
             'answer': answer,
             'confidence': confidence,
             'citations': citations,
-            'followup_questions': followup_questions
+            'followup_questions': followup_questions,
+            'abstained': abstained,
+            'abstain_reason': 'low_confidence' if abstained else '',
+            'next_best_queries': self._fallback_next_best_queries(query, query_analysis)
         }
     
+    def _fallback_next_best_queries(self, query: str, query_analysis: Dict[str, Any]) -> List[str]:
+        """Suggest best-next refinements when confidence is low."""
+        hints = []
+        components = query_analysis.get('components', [])
+        if components:
+            hints.append(f"Can you share if you mean {'/'.join(components[:2])} specifically?")
+        hints.extend([
+            "Can you include exact register names or bit fields?",
+            "Do you want initialization steps or troubleshooting guidance?",
+            "Can you provide the peripheral and MCU pin mapping details?"
+        ])
+        return hints[:3]
+
     def _prepare_context(self, retrieved_docs: List[Dict[str, Any]]) -> str:
         """
         Prepare context string from retrieved documents
@@ -256,7 +306,10 @@ class AgenticRAG:
                 'answer': "Hello! I'm your STM32F446RE documentation assistant. I can help you with questions about STM32F446RE microcontroller registers, peripherals, configuration, and technical documentation.",
                 'confidence': 0.95,
                 'citations': [],
-                'followup_questions': ["What would you like to know about the STM32F446RE?", "Do you need help with GPIO configuration?", "Are you working on a specific peripheral?"]
+                'followup_questions': ["What would you like to know about the STM32F446RE?", "Do you need help with GPIO configuration?", "Are you working on a specific peripheral?"],
+                'abstained': False,
+                'abstain_reason': '',
+                'next_best_queries': []
             }
         
         # Handle capability questions
@@ -291,7 +344,14 @@ class AgenticRAG:
             'answer': "I don't have specific information about that topic in the STM32F446RE documentation. Please try rephrasing your question or ask about specific registers, peripherals, or configuration topics related to the STM32F446RE.",
             'confidence': 0.1,
             'citations': [],
-            'followup_questions': []
+            'followup_questions': [],
+            'abstained': True,
+            'abstain_reason': 'insufficient_documentation_context',
+            'next_best_queries': [
+                "Which STM32F446RE peripheral are you using?",
+                "Can you share the exact register name or pin?",
+                "Should I focus on setup steps, troubleshooting, or comparison?"
+            ]
         }
 
     def _construct_prompt(self, query: str, context: str, query_analysis: Dict[str, Any]) -> str:
@@ -392,20 +452,20 @@ class QueryAnalyzer:
             'what', 'how', 'when', 'where', 'which', 'who', 'why',
             'define', 'explain', 'describe', 'tell me about'
         }
-        
+
         self.procedural_keywords = {
-            'configure', 'set up', 'initialize', 'enable', 'disable', 
+            'configure', 'set up', 'setup', 'initialize', 'enable', 'disable',
             'connect', 'implement', 'use', 'program'
         }
-        
+
         self.comparative_keywords = {
-            'difference', 'compare', 'versus', 'vs', 'between', 
+            'difference', 'compare', 'versus', 'vs', 'between',
             'similarities', 'better', 'alternative'
         }
-        
+
         self.troubleshooting_keywords = {
-            'problem', 'issue', 'debug', 'fix', 'solution', 
-            'doesn\'t work', 'error', 'not working', 'help'
+            'problem', 'issue', 'debug', 'fix', 'solution',
+            'doesn\'t work', 'not working', 'error', 'help'
         }
     
     def analyze(self, query: str) -> Dict[str, Any]:
@@ -422,13 +482,13 @@ class QueryAnalyzer:
         words = query_lower.split()
         
         # Determine query type
-        if any(word in self.troubleshooting_keywords for word in words):
+        if self._matches_keywords(query_lower, words, self.troubleshooting_keywords):
             query_type = QueryType.TROUBLESHOOTING
-        elif any(word in self.comparative_keywords for word in words):
+        elif self._matches_keywords(query_lower, words, self.comparative_keywords):
             query_type = QueryType.COMPARATIVE
-        elif any(word in self.procedural_keywords for word in words):
+        elif self._matches_keywords(query_lower, words, self.procedural_keywords):
             query_type = QueryType.PROCEDURAL
-        elif any(word in self.simple_keywords for word in words[:3]):  # Check first 3 words
+        elif self._matches_keywords(query_lower, words[:3], self.simple_keywords):
             query_type = QueryType.SIMPLE_FACT
         else:
             query_type = QueryType.COMPLEX_REASONING
@@ -442,6 +502,16 @@ class QueryAnalyzer:
             'length': len(words),
             'complexity': self._estimate_complexity(query)
         }
+
+    def _matches_keywords(self, query_lower: str, tokens: List[str], keywords: set) -> bool:
+        """Match both single-token and phrase keywords against a query."""
+        for keyword in keywords:
+            if " " in keyword:
+                if keyword in query_lower:
+                    return True
+            elif keyword in tokens:
+                return True
+        return False
     
     def _extract_components(self, query: str) -> List[str]:
         """

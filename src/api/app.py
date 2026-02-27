@@ -56,6 +56,7 @@ class QueryRequest(BaseModel):
     min_confidence: float = Field(default=0.3, ge=0.0, le=1.0, description="Minimum confidence threshold")
     include_citations: bool = Field(default=True, description="Include citations in response")
     include_followup: bool = Field(default=True, description="Include follow-up questions")
+    include_debug: bool = Field(default=False, description="Include retrieval diagnostics")
 
 
 class QueryResponse(BaseModel):
@@ -67,6 +68,10 @@ class QueryResponse(BaseModel):
     retrieved_docs_count: int
     followup_questions: List[str]
     processing_time: float
+    abstained: bool = False
+    abstain_reason: str = ""
+    next_best_queries: List[str] = Field(default_factory=list)
+    debug: Optional[Dict[str, Any]] = None
 
 
 class DocumentLoadRequest(BaseModel):
@@ -188,6 +193,16 @@ async def query_documentation(request: QueryRequest):
         processing_time = time.time() - start_time
         
         # Check if confidence meets threshold
+        debug_payload = None
+        if request.include_debug:
+            debug_payload = {
+                "query_type": str(response.get('query_type')),
+                "retrieval_strategy": response.get('retrieval_strategy'),
+                "retrieval_filters": response.get('retrieval_filters', {}),
+                "reasoning_trace": response.get('reasoning_trace', []),
+                "top_similarities": [round(d.get('similarity', 0.0), 4) for d in response.get('retrieved_docs', [])[:5]]
+            }
+
         if response['confidence'] < request.min_confidence:
             # Return a response indicating low confidence
             return QueryResponse(
@@ -201,7 +216,11 @@ async def query_documentation(request: QueryRequest):
                 citations=[] if not request.include_citations else response['citations'][:3],
                 retrieved_docs_count=len(response['retrieved_docs']),
                 followup_questions=[] if not request.include_followup else response['followup_questions'][:3],
-                processing_time=processing_time
+                processing_time=processing_time,
+                abstained=True,
+                abstain_reason=response.get('abstain_reason', 'low_confidence'),
+                next_best_queries=response.get('next_best_queries', []),
+                debug=debug_payload
             )
         
         # Return successful response
@@ -212,7 +231,11 @@ async def query_documentation(request: QueryRequest):
             citations=[] if not request.include_citations else response['citations'],
             retrieved_docs_count=len(response['retrieved_docs']),
             followup_questions=[] if not request.include_followup else response['followup_questions'],
-            processing_time=processing_time
+            processing_time=processing_time,
+            abstained=response.get('abstained', False),
+            abstain_reason=response.get('abstain_reason', ''),
+            next_best_queries=response.get('next_best_queries', []),
+            debug=debug_payload
         )
     except Exception as e:
         logger.error(f"Error processing query: {str(e)}")

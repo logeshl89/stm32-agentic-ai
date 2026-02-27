@@ -88,7 +88,13 @@ class AnswerGenerator:
         confidence = self.confidence_scorer.compute_confidence(
             formatted_answer, query, valid_docs
         )
-        
+
+        confidence = self._calibrate_confidence(
+            confidence,
+            valid_docs,
+            processed_response.get('validation_passed', True)
+        )
+
         citations = self.citation_formatter.format_citations(
             valid_docs, query, formatted_answer
         )
@@ -215,6 +221,21 @@ Response:"""
             query_type=query_type
         )
     
+    def _calibrate_confidence(self, base_confidence: float, docs: List[Dict[str, Any]], validation_passed: bool) -> float:
+        """Calibrate confidence using retrieval margin and validation signal."""
+        if not docs:
+            return 0.0
+
+        sorted_scores = sorted([d.get('similarity', 0.0) for d in docs], reverse=True)
+        top_score = sorted_scores[0] if sorted_scores else 0.0
+        margin = (sorted_scores[0] - sorted_scores[1]) if len(sorted_scores) > 1 else top_score
+
+        calibrated = 0.7 * base_confidence + 0.2 * top_score + 0.1 * max(0.0, margin)
+        if not validation_passed:
+            calibrated *= 0.7
+
+        return max(0.0, min(1.0, calibrated))
+
     def _generate_no_result_answer(self, query: str) -> Dict[str, Any]:
         """
         Generate an answer when no relevant documents are found
